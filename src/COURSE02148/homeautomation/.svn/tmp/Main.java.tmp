@@ -1,0 +1,31 @@
+package COURSE02148.homeautomation;
+
+import COURSE02148.homeautomation.clients.PC.PCClient;
+import COURSE02148.homeautomation.clients.mediacenter.MediaCenterClient;
+import COURSE02148.homeautomation.frontend.Frontend;
+import COURSE02148.homeautomation.server.Server;
+
+import java.io.IOException;
+
+public class Main {
+
+    public static void main(String[] args) throws Exception {
+
+        //Server should have port 8080
+        //Frontend should have port 8081
+        //MediaCenterClient should have port 8082
+        //PCClient should have port 8085
+        Server server = new Server(8080, 8081);
+        Frontend frontend = new Frontend(8080, 8081);
+        MediaCenterClient client = new MediaCenterClient(8080, 8082);
+        PCClient marcPCClient = new PCClient(8080,8083);
+
+
+        server.startServer();
+        frontend.startFrontend();
+        client.startClient();
+        marcPCClient.startClient();
+
+
+    }
+}

@@ -1,0 +1,193 @@
+package COURSE02148.homeautomation.server;
+
+
+import COURSE02148.homeautomation.server.api.API;
+import COURSE02148.homeautomation.server.api.Intent;
+import COURSE02148.homeautomation.server.api.WitResponse;
+import COURSE02148.homeautomation.server.templates.TemplateClientHandle;
+import COURSE02148.homeautomation.server.templates.TemplateClientREADY;
+import com.sun.istack.internal.NotNull;
+import com.sun.istack.internal.Nullable;
+import org.cmg.resp.behaviour.Agent;
+import org.cmg.resp.knowledge.ActualTemplateField;
+import org.cmg.resp.knowledge.FormalTemplateField;
+import org.cmg.resp.knowledge.Template;
+import org.cmg.resp.knowledge.Tuple;
+import org.cmg.resp.knowledge.ts.TupleSpace;
+import org.cmg.resp.topology.PointToPoint;
+import org.cmg.resp.topology.Self;
+import org.cmg.resp.topology.SocketPortAddress;
+import org.json.JSONException;
+
+import java.io.IOException;
+
+public class ServerAgent extends Agent {
+
+    PointToPoint pointToFrontend;
+    PointToPoint ptp;
+
+    TupleSpace serverTupleSpace;
+    String responseText;
+
+    Tuple responseTuple;
+
+    long serverSyncTime;
+
+
+    public ServerAgent(TupleSpace serverTupleSpace, int frontendPort) {
+        super("Server Agent");
+        this.serverTupleSpace = serverTupleSpace;
+        this.pointToFrontend = new PointToPoint("Frontend", new SocketPortAddress(frontendPort));
+    }
+
+    private Template templateVoiceCommand = new Template(new ActualTemplateField("VOICE_C"), new FormalTemplateField(byte[].class));
+    private Template templateResponse = new Template(new ActualTemplateField("RESPONSE"), new FormalTemplateField(String.class));
+    private Template templateState = new Template(new ActualTemplateField("STATE"), new FormalTemplateField(String.class), new FormalTemplateField(WitResponse.class));
+
+
+    @Override
+    protected void doRun() throws IOException, InterruptedException, JSONException {
+
+        while (true){
+            // Get voice command from pointToFrontend
+            Tuple tupleVoice = get(templateVoiceCommand, Self.SELF);
+            byte[] voiceRecording = (byte[]) tupleVoice.getElementAt(1);
+
+            // Check for active states (may be null for no active state)
+            Tuple tupleState = serverTupleSpace.getp(templateState);
+            String intent = API.WIT.voiceRecognition(voiceRecording, getState(tupleState));
+
+            // Parse the intent from JSON
+            WitResponse witResponse = new WitResponse(intent);
+
+            // Check for previous dialogues and retrieve information
+            checkActiveDialogs(witResponse, tupleState);
+
+            // Display the intent (only for debug)
+            System.out.println(intent);
+
+            // Send command to appropriate client
+            routeCommandToClient(witResponse);
+
+            // Send result back to frontend
+            byte[] responseVoice = API.IBMWATSON.textToSpeech(responseText);
+            Tuple responseTuple = new Tuple("RESPONSE", responseVoice, responseText);
+            put(responseTuple, pointToFrontend);
+
+        }
+
+    }
+
+    private void checkActiveDialogs(WitResponse witResponse, Tuple tupleState) {
+        if (tupleState == null) return;
+        if (!witResponse.hasIntent()) {
+            restoreState(tupleState);
+            return;
+        }
+        if (witResponse.get(Intent.INTENT).equals("cancel")) return;
+        WitResponse oldWitResponse = (WitResponse) tupleState.getElementAt(2);
+        witResponse.merge(oldWitResponse);
+    }
+
+    private void restoreState(Tuple tupleState){
+        try {
+            put(tupleState, Self.SELF);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private String getState(Tuple tupleState){
+        if (tupleState == null) return null;
+        return (String) tupleState.getElementAt(1);
+    }
+
+    public boolean routeCommandToClient(WitResponse witResponse) throws IOException, InterruptedException {
+        // No intent was generated!
+        if (!witResponse.hasIntent()){
+            responseText = "I don't know what you mean";
+            return false;
+        }
+
+        String command = (String) witResponse.get(Intent.INTENT);
+        System.out.println("COMMAND:" + command);
+        Tuple handlerTuple = serverTupleSpace.queryp(new TemplateClientHandle(command));
+
+    /*    Tuple handlerTuple = serverTupleSpace.queryp(new Template(new ActualTemplateField("HANDLE"),
+                new ActualTemplateField("play_music"),
+                new ActualTemplateField(""),
+                new ActualTemplateField("Media center"),
+                new ActualTemplateField("0.0.0.0"),
+                new ActualTemplateField(8082),
+                new ActualTemplateField(true)));*/
+        System.out.println(handlerTuple);
+        // No client to handle the command
+        if (handlerTuple == null) {
+            responseText = "I could not find a service to handle your request";
+            return false;
+        }
+
+        // Found client, sending command to client for processing
+        sendCommandToClient(handlerTuple, witResponse);
+
+        serverSyncTime = System.currentTimeMillis();
+        processResponse(handlerTuple);
+
+        //Tuple responseTuple = waitForResponse(2000, templateResponse);
+
+
+        if (responseTuple == null){
+            responseText = "Error. The client did not respond to your request";
+            return false;
+        }
+
+        responseText = (String) responseTuple.getElementAt(1);
+        return true;
+
+    }
+
+    private void processResponse(Tuple handlerTuple) {
+        boolean sync = (boolean) handlerTuple.getElementAt(6);
+
+        if (sync) {
+            Tuple tupleReady = waitForResponse(2000, new TemplateClientREADY());
+            Tuple tuple = new Tuple("GO", System.currentTimeMillis(), serverSyncTime + 10000);
+            try {
+                put(tuple, ptp);
+            } catch (InterruptedException | IOException e) {
+                e.printStackTrace();
+            }
+            responseTuple = waitForResponse(2000, templateResponse);
+
+        } else {
+            responseTuple = waitForResponse(2000, templateResponse);
+        }
+    }
+
+    public void sendCommandToClient(Tuple handleTuple, WitResponse witResponse) throws IOException, InterruptedException {
+        int port = (int) handleTuple.getElementAt(5);
+        String name = (String) handleTuple.getElementAt(3);
+        ptp = new PointToPoint(name, new SocketPortAddress(port));
+        put(new Tuple("INTENT", witResponse), ptp);
+    }
+
+    public Tuple waitForResponse(long timeout, Template template){
+        long step = 100;
+        long process = 0;
+        while(process < timeout){
+            process += step;
+            Tuple responseTuple = serverTupleSpace.getp(template);
+            if (responseTuple == null){
+                try {
+                    Thread.sleep(step);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                continue;
+            }
+            return responseTuple;
+        }
+        return null;
+    }
+
+}

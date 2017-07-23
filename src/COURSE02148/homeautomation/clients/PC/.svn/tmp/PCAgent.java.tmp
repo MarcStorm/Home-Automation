@@ -1,0 +1,29 @@
+package COURSE02148.homeautomation.clients.PC;
+
+import COURSE02148.homeautomation.clients.Client;
+import COURSE02148.homeautomation.clients.ClientAgent;
+import COURSE02148.homeautomation.clients.Handle;
+import COURSE02148.homeautomation.server.api.WitResponse;
+
+/**
+ * Created by Marc on 08/01/16.
+ */
+public class PCAgent extends ClientAgent {
+
+    public PCAgent(Client client) {
+        super(client);
+    }
+
+    @Handle("display")
+    public void chooseAction(String Command, String json) {
+        WitResponse witResponse = new WitResponse(json);
+
+        if (!witResponse.getIntents().isEmpty()) {
+            if (witResponse.getIntents().get(0).getIntent().equals("display")) {
+                System.out.println(123);
+            } else {
+                System.out.println("CLIENT: SOMETHING ELSE");
+            }
+        }
+    }
+}

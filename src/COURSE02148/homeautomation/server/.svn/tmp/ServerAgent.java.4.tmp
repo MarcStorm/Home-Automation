@@ -1,0 +1,369 @@
+package COURSE02148.homeautomation.server;
+
+
+import COURSE02148.homeautomation.frontend.Command;
+import COURSE02148.homeautomation.server.api.API;
+import COURSE02148.homeautomation.server.api.Context;
+import COURSE02148.homeautomation.server.api.Intent;
+import COURSE02148.homeautomation.server.api.WitResponse;
+import COURSE02148.homeautomation.server.exceptions.ErrorResponse;
+import COURSE02148.homeautomation.server.exceptions.FoundResponseException;
+import COURSE02148.homeautomation.server.exceptions.HandlingCompleteException;
+import COURSE02148.homeautomation.server.exceptions.IbmResponseException;
+import COURSE02148.homeautomation.server.exceptions.WitResponseException;
+import COURSE02148.homeautomation.server.templates.TemplateClientHandle;
+import COURSE02148.homeautomation.server.templates.TemplateClientReady;
+import jodd.http.HttpException;
+import org.apache.commons.io.IOUtils;
+import org.cmg.resp.behaviour.Agent;
+import org.cmg.resp.knowledge.ActualTemplateField;
+import org.cmg.resp.knowledge.FormalTemplateField;
+import org.cmg.resp.knowledge.Template;
+import org.cmg.resp.knowledge.Tuple;
+import org.cmg.resp.knowledge.ts.TupleSpace;
+import org.cmg.resp.topology.PointToPoint;
+import org.cmg.resp.topology.Self;
+import org.cmg.resp.topology.SocketPortAddress;
+import org.json.JSONException;
+
+import java.io.*;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.UUID;
+
+public class ServerAgent extends Agent {
+
+    PointToPoint pointToFrontend;
+    PointToPoint ptp;
+
+    TupleSpace serverTupleSpace;
+    String responseText;
+
+    Tuple responseTuple;
+
+    HashMap<UUID, Tuple> awaitingHandlers;
+    HashMap<UUID, Tuple> syncReadyHandlers;
+    HashMap<UUID, Tuple> syncCompletedHandlers;
+
+    long serverSyncTime;
+
+    private Timer failureDetector;
+    private static final int CHECK_CLIENTS_PERIOD = 10000;
+
+    public ServerAgent(TupleSpace serverTupleSpace, int frontendPort) {
+        super("Server Agent");
+        this.serverTupleSpace = serverTupleSpace;
+        this.pointToFrontend = new PointToPoint("Frontend", new SocketPortAddress(frontendPort));
+    }
+
+    private Template templateCommand = new Template(new ActualTemplateField("COMMAND"), new FormalTemplateField(Command.class), new FormalTemplateField(Object.class));
+    private Template templateResponse = new Template(new ActualTemplateField("RESPONSE"), new FormalTemplateField(UUID.class), new FormalTemplateField(String.class));
+    private Template templateState = new Template(new ActualTemplateField("STATE"), new FormalTemplateField(Context.class), new FormalTemplateField(WitResponse.class));
+
+
+    @Override
+<<<<<<< .mine
+    protected void doRun() throws IOException, InterruptedException, JSONException {
+=======
+    protected void doRun() throws IOException, InterruptedException, JSONException, WitResponseException, IbmResponseException {
+>>>>>>> .r77
+        createFailureDetector();
+        while (true){
+
+            // Get voice command from pointToFrontend
+            Tuple tupleCommand = get(templateCommand, Self.SELF);
+            Object commandMedia = tupleCommand.getElementAt(2);
+
+            // Check for active states (may be null for no active state)
+            Tuple tupleState = serverTupleSpace.getp(templateState);
+            String intent = null;
+            try {
+                intent = API.WIT.mediaRecognition(commandMedia, getState(tupleState));
+            // Exception for when server could not connect to WIT.
+            } catch (HttpException e) {
+                sendLocalResponseToFrontend(ErrorResponse.INTERNET_ERROR);
+                continue;
+            } catch (WitResponseException e) {
+                sendLocalResponseToFrontend(ErrorResponse.SERVICE_ERROR);
+                continue;
+            }
+
+            // Parse the intent from JSON
+            WitResponse witResponse = new WitResponse(intent);
+
+            // Check for previous dialogues and retrieve information
+            checkActiveDialogs(witResponse, tupleState);
+
+            // Display the intent (only for debug)
+            System.out.println(intent);
+
+            // Send command to appropriate client
+            routeCommandToClient(witResponse);
+
+            // Send result back to frontend
+            byte[] responseVoice = API.IBMWATSON.textToSpeech(responseText);
+            Tuple responseTuple = new Tuple("RESPONSE", responseVoice, responseText);
+            put(responseTuple, pointToFrontend);
+        }
+    }
+
+    private void sendLocalResponseToFrontend(ErrorResponse errorResponse) throws IOException, InterruptedException {
+        File file = new File(errorResponse.getPathname());
+        InputStream input = new FileInputStream(file);
+        byte[] responseVoice = IOUtils.toByteArray(input);
+        //This string is hardcoded. Depending on further changes to the audio file, this might not match it.
+        Tuple tuple = new Tuple("RESPONSE", responseVoice, errorResponse.getResponseText());
+        put(tuple, pointToFrontend);
+        return;
+    }
+
+    private void checkActiveDialogs(WitResponse witResponse, Tuple tupleState) {
+        if (tupleState == null) return;
+        if (!witResponse.hasIntent()) {
+            restoreState(tupleState);
+            return;
+        }
+        if (witResponse.get(Intent.INTENT).equals("cancel")) return;
+        WitResponse oldWitResponse = (WitResponse) tupleState.getElementAt(2);
+        witResponse.merge(oldWitResponse);
+    }
+
+    private void restoreState(Tuple tupleState){
+        try {
+            put(tupleState, Self.SELF);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private Context getState(Tuple tupleState){
+        if (tupleState == null) return null;
+        return (Context) tupleState.getElementAt(1);
+    }
+
+    public boolean routeCommandToClient(WitResponse witResponse) throws IOException, InterruptedException {
+        // No intent was generated!
+        if (!witResponse.hasIntent()){
+            responseText = "I don't know what you mean";
+            return false;
+        }
+
+        String command = (String) witResponse.get(Intent.INTENT);
+        LinkedList<Tuple> handles = serverTupleSpace.queryAll(new TemplateClientHandle(command));
+
+        // No client to handle the command
+        if (handles.isEmpty()) {
+            responseText = "I could not find a service to handle your request";
+            return false;
+        }
+
+        System.out.println("NUMBER OF CLIENTS: " + handles.size());
+
+        // Found client, sending command to client for processing
+        System.out.println("SEND INTENT TO CLIENTS");
+        sendCommandToClient(handles, witResponse);
+
+        serverSyncTime = System.currentTimeMillis();
+
+        // Get all normal responses. Awaiting handlers -> Sync ready handlers
+        System.out.println("START HANDLE RESPONSES");
+        handleResponses(3000, handles);
+
+        // Send GO tuple to all handlers in sync ready handlers
+        System.out.println("START SYNC TASKS");
+        startSynchronisedTasks();
+
+        System.out.println("CLIENTS NO ANSWER: " + awaitingHandlers.size());
+        System.out.println("CLIENT SYNC COUNT: " + syncReadyHandlers.size());
+
+        // Wait for sync task responses. Sync ready handlers -> sync completed handlers
+        waitForSyncResponses(3000);
+
+        System.out.println("CLIENTS UNABLE TO START: " + syncReadyHandlers.size());
+        System.out.println("CLIENTS COMPLETED: " + syncCompletedHandlers.size());
+
+        if (responseTuple == null){
+            responseText = "Error. The client did not respond to your request";
+            return false;
+        }
+
+        responseText = (String) responseTuple.getElementAt(2);
+        return true;
+
+    }
+
+    private void startSynchronisedTasks(){
+        // If there are no sync tasks to perform, return
+        if (syncReadyHandlers.isEmpty()) return;
+
+        for (Map.Entry<UUID, Tuple> entry : syncReadyHandlers.entrySet()){
+            Tuple handle = entry.getValue();
+
+            System.out.println("GET CLIENT PORT");
+            int port = (int) handle.getElementAt(6);
+            System.out.println("GET CLIENT NAME");
+            String name = (String) handle.getElementAt(4);
+            PointToPoint pointClient = new PointToPoint(name, new SocketPortAddress(port));
+
+            Tuple tuple = new Tuple("GO", System.currentTimeMillis(), serverSyncTime + 5000);
+            // Put tuple in client tuplespace
+            try {
+                put(tuple, pointClient);
+            } catch (InterruptedException | IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public void waitForSyncResponses(long timeout){
+        syncCompletedHandlers = new HashMap<>();
+        if (syncReadyHandlers.isEmpty()) return;
+
+        long step = 100;
+        long process = 0;
+        while(process < timeout){
+
+            Tuple responseTuple = serverTupleSpace.getp(templateResponse);
+            if (responseTuple != null){
+                UUID clientUUID = (UUID) responseTuple.getElementAt(1);
+                Tuple tuple = syncReadyHandlers.remove(clientUUID);
+                syncCompletedHandlers.put(clientUUID, tuple);
+                if (syncReadyHandlers.isEmpty()) break;
+                continue;
+            }
+
+            // Sleep
+            process += step;
+            try {
+                Thread.sleep(step);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+        responseTuple = new Tuple("RESPONSE", "Server", "Okay. I completed your request on " + syncCompletedHandlers.size() + " clients");
+    }
+
+    public void sendCommandToClient(LinkedList<Tuple> handles, WitResponse witResponse) throws IOException, InterruptedException {
+        for (Tuple handlerTuple : handles){
+            int port = (int) handlerTuple.getElementAt(6);
+            String name = (String) handlerTuple.getElementAt(4);
+            ptp = new PointToPoint(name, new SocketPortAddress(port));
+            put(new Tuple("INTENT", witResponse), ptp);
+        }
+    }
+
+    public void handleResponses(long timeout, LinkedList<Tuple> handles){
+        awaitingHandlers = new HashMap<>();
+        syncReadyHandlers = new HashMap<>();
+
+        // Add all handlers as awaiting responses
+        for (Tuple handle : handles){
+            UUID clientUUID = (UUID) handle.getElementAt(3);
+            awaitingHandlers.put(clientUUID, handle);
+        }
+
+        long step = 100;
+        long process = 0;
+        while(process < timeout){
+
+            // Handling for normal tasks
+            try {
+                retrieveTupleResponse(templateResponse);
+            } catch (HandlingCompleteException e) {
+                break;
+            } catch (FoundResponseException e) {
+                continue;
+            }
+
+            // Handling for synchronized tasks
+            try {
+                retrieveTupleSyncResponse(new TemplateClientReady());
+            } catch (HandlingCompleteException e) {
+                break;
+            } catch (FoundResponseException e) {
+                continue;
+            }
+
+            // Sleep
+            try {
+                process += step;
+                Thread.sleep(step);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void retrieveTupleResponse(Template template) throws HandlingCompleteException, FoundResponseException {
+        // Attempt to retrieve tuple
+        Tuple responseTuple = serverTupleSpace.getp(template);
+        if (responseTuple == null) return;
+
+        // Remove handler from awaiting handlers
+        this.responseTuple = responseTuple;
+        UUID clientUUID = (UUID) responseTuple.getElementAt(1);
+        awaitingHandlers.remove(clientUUID);
+
+        // Throw exceptions based on the outcome
+        if (awaitingHandlers.isEmpty()) throw new HandlingCompleteException();
+        throw new FoundResponseException();
+    }
+
+    private void retrieveTupleSyncResponse(Template template) throws HandlingCompleteException, FoundResponseException {
+        // Attempt to retrieve tuple
+        Tuple syncResponseTuple = serverTupleSpace.getp(template);
+        if (syncResponseTuple == null) return;
+
+        // If found, remove from awaiting handlers and put in ready handlers
+        UUID clientUUID = (UUID) syncResponseTuple.getElementAt(1);
+        Tuple handle = awaitingHandlers.remove(clientUUID);
+        syncReadyHandlers.put(clientUUID, handle);
+
+        // Throw exceptions based on the outcome
+        if (awaitingHandlers.isEmpty()) throw new HandlingCompleteException();
+        throw new FoundResponseException();
+    }
+
+
+    public Tuple waitForResponse(long timeout, Template template){
+        long step = 100;
+        long process = 0;
+        while(process < timeout){
+            process += step;
+            Tuple responseTuple = serverTupleSpace.getp(template);
+            if (responseTuple == null){
+                try {
+                    Thread.sleep(step);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                continue;
+            }
+            return responseTuple;
+        }
+        return null;
+    }
+    private void createFailureDetector(){
+        System.out.println("Setting up failure detector");
+        TimerTask task = new TimerTask(){
+            @Override
+            public void run() {
+                Template template = new Template(new ActualTemplateField("FAILURE_DETECTOR"),new FormalTemplateField(String.class),new FormalTemplateField(Integer.class));
+                System.out.println("I am the failure detector");
+                try {
+                    System.out.println("I am looking for a tuple");
+                    serverTupleSpace.getp(template);
+                    System.out.println("I found a tuple");
+                } catch (Exception e) {
+                    System.out.println("I did not find a tuple");
+                }
+            }
+        };
+        this.failureDetector = new Timer();
+        failureDetector.scheduleAtFixedRate(task,0, CHECK_CLIENTS_PERIOD);
+    }
+
+}

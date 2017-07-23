@@ -1,0 +1,163 @@
+package COURSE02148.homeautomation.clients;
+
+import COURSE02148.homeautomation.server.api.Context;
+import COURSE02148.homeautomation.server.api.Intent;
+import COURSE02148.homeautomation.server.api.WitResponse;
+import org.cmg.resp.behaviour.Agent;
+import org.cmg.resp.knowledge.ActualTemplateField;
+import org.cmg.resp.knowledge.FormalTemplateField;
+import org.cmg.resp.knowledge.Template;
+import org.cmg.resp.knowledge.Tuple;
+import org.cmg.resp.topology.PointToPoint;
+import org.cmg.resp.topology.Self;
+import org.cmg.resp.topology.SocketPortAddress;
+
+import java.io.IOException;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.Timer;
+import java.util.TimerTask;
+
+public abstract class ClientAgent extends Agent {
+
+    private PointToPoint pointToServer;
+    private Client client;
+    private HashMap<String, Method> handlers;
+    private WitResponse witResponse;
+    private Timer failureDetectorTimer;
+    private static final int FAILURE_PERIOD = 10000;
+
+    public ClientAgent(Client client) {
+        super("Client Agent");
+        this.handlers = new HashMap<>();
+        this.client = client;
+        this.pointToServer = new PointToPoint("Server", new SocketPortAddress(client.serverPort));
+    }
+
+    private Template templateIntent = new Template(new ActualTemplateField("INTENT"),
+            new FormalTemplateField(WitResponse.class));
+
+    // Intent, server time, server start time (server time + a defined offset)
+    private Template templateGo = new Template(new ActualTemplateField("GO"),
+            new FormalTemplateField(Long.class),
+            new FormalTemplateField(Long.class));
+
+    @Override
+    protected void doRun() throws Exception {
+
+        initialiseHandlers();
+        createTimerForFailureDetector();
+
+            while(true){
+                // Look for incoming commands
+                Tuple requestTuple = get(templateIntent, Self.SELF);
+                witResponse = (WitResponse) requestTuple.getElementAt(1);
+
+                // Invoke the responsible method for handling the command
+                invokeHandler(witResponse);
+            }
+
+    }
+
+    public void putResponse(String result){
+        try {
+            put(new Tuple("RESPONSE", client.clientUUID, result), pointToServer);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void putState(Context state, String question){
+        try {
+            put(new Tuple("STATE", state, witResponse), pointToServer);
+            putResponse(question);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void initialiseHandlers(){
+        Class myClass = this.getClass();
+
+        for (Method method : myClass.getDeclaredMethods()){
+            for (Annotation annotation : method.getAnnotations()){
+                if (annotation instanceof Handle){
+                    Handle handle = (Handle) annotation;
+                    handlers.put(handle.value(), method);
+                    sendHandleToServer(handle);
+                }
+            }
+        }
+    }
+
+    private void sendHandleToServer(Handle handle){
+        Tuple tuple = new Tuple("HANDLE", handle.value(), "", client.clientUUID, client.clientName, "0.0.0.0", client.clientPort, handle.sync());
+        try {
+            put(tuple, pointToServer);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void invokeHandler(WitResponse witResponse){
+        String command = (String) witResponse.get(Intent.INTENT);
+        Method method = handlers.get(command);
+
+        if (method == null){
+            putResponse("Client had no implementation to handle your request. Please inform the administrators");
+            return;
+        }
+
+        try {
+            method.invoke(this, witResponse);
+        } catch (IllegalAccessException | InvocationTargetException | IllegalArgumentException e) {
+            putResponse("The client was subject to an internal error. Please inform the administrators");
+        }
+    }
+
+    public long waitForSync() {
+        Tuple tuple = new Tuple("READY", client.clientUUID, client.clientName, "0.0.0.0", client.clientPort);
+        try {
+            put(tuple, pointToServer);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+
+        Tuple tupleGO = null;
+        try {
+            tupleGO = get(templateGo, Self.SELF);
+        } catch (InterruptedException | IOException e) {
+            e.printStackTrace();
+        }
+
+        //server time, server start time (server time + a defined offset)
+        long serverTime = (long) tupleGO.getElementAt(1);
+        long serverStartTime = (long) tupleGO.getElementAt(2);
+
+        //Calculate clients offset in perspective to the server.
+        long clientOffset = System.currentTimeMillis() - serverTime;
+
+        //Calculate the local time for the client when to start the execution.
+        return serverStartTime - clientOffset;
+}
+    private void createTimerForFailureDetector(){
+        TimerTask task = new TimerTask(){
+            @Override
+            public void run() {
+                Tuple tuple = new Tuple("FAILURE_DETECTOR",client.clientName,client.clientPort);
+                try {
+                    put(tuple,pointToServer);
+                    System.out.println("i put a tuple in for the failure detector to find");
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        };
+        this.failureDetectorTimer = new Timer();
+        failureDetectorTimer.scheduleAtFixedRate(task,0, FAILURE_PERIOD);
+    }
+}

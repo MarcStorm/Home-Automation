@@ -1,0 +1,9 @@
+K 10
+svn:ignore
+V 50
+*.wav
+VoiceCommand.WAVE
+opus_out.wav
+response.ogg
+
+END
